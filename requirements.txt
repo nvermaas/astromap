@@ -1,0 +1,7 @@
+astropy==6.1.7
+astroquery==0.4.11
+numpy==2.2.6
+Pillow==12.3.0
+reproject
+matplotlib
+requests
