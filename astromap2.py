@@ -86,20 +86,23 @@ def fetch_file_list(query_url: str, fits_json_path, jpg_json_path) -> list[dict]
         results, next_page = do_GET_LIST_page(query=query_url,page=next_page)
         data = data + results
 
-    out = []
+    file_list = []
     for item in data:
+
         record = {}
         try:
+            record['id'] = item['id']
             record['name'] = item['name']
             record['fits'] = item['derived_fits']
             record['jpg'] = item['derived_raw_image']
             record['quality'] = item['quality']
             record['field_fov'] = item['field_fov']
-            out.append(record)
+            record['used_in_hips'] = item['used_in_hips']
+            file_list.append(record)
         except Exception:
             pass
 
-    return out
+    return file_list
 
 
 def download(url: str, dest: Path, headers: dict | None = None) -> Path:
@@ -255,6 +258,8 @@ def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
 
     n_ok = 0
     for item in items:
+        print(item)
+
         try:
             _, wcs, _ = load_image_and_wcs(item["fits"], item["jpg"], workdir, headers)
         except Exception as e:
@@ -280,10 +285,16 @@ def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
             edgecolor = "#00C000"
             facecolor = "#C0FFC0"
             zorder=3
+
         elif item['quality'] == 'medium':
             edgecolor = "#C0C0C0"
             facecolor = "#E6E4E4"
             zorder=2
+
+        elif item['quality'] == 'bad':
+            edgecolor = "red"
+            facecolor = "#000000"
+            zorder=1
 
         ax.add_patch(Polygon(np.column_stack([x, y]), closed=True,
                              facecolor=facecolor, edgecolor=edgecolor,
@@ -403,7 +414,8 @@ def build_mosaic(items: list[dict], workdir: Path, headers: dict | None,
 def main():
     p = argparse.ArgumentParser(description="Project FITS URLs onto an all-sky image.")
     p.add_argument("--query",
-                   default="https://uilennest.net/my_astrobase/observations2/?quality__in=great,good,medium&field_fov__lte=20",
+                   #default="https://uilennest.net/my_astrobase/observations2/?quality__in=great,good,medium&field_fov__lte=20&used_in_hips=True",
+                   default="https://uilennest.net/my_astrobase/observations2/?used_in_hips=True&field_fov__lte=20",
                    help="REST API URL returning a JSON list (or wrapped list)")
     p.add_argument("--fits-json-path", default="fits",
                    help="Dotted JSON path to the FITS URL in each item "
@@ -434,8 +446,8 @@ def main():
 
     if DEBUG:
         items = [
-            {"fits": "https://woodland.uilennest.net/astrobase/data/240213005/9934006.fits",
-             "jpg" : "https://woodland.uilennest.net/astrobase/data/240213005/240213005_raw.jpg"
+            {"fits": "https://woodland.uilennest.net/astrobase/data/250329003/12863762.fits",
+             "jpg" : "https://woodland.uilennest.net/astrobase/data/250329003/250329003_raw.jpg"
             }
         ]
 
