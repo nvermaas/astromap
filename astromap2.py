@@ -1,5 +1,5 @@
 """
-sky_projection.py
+astromap2.py
 =================
 Query a REST API that returns a list of FITS URLs, then project those images
 onto an all-sky map in one of two modes:
@@ -19,12 +19,10 @@ Requirements:
     pip install astropy reproject matplotlib numpy requests pillow
 
 Usage:
-    python sky_projection.py \
-        --query "https://api.example.org/observations" \
-        --fits-json-path "fits_url" --jpg-json-path "jpg_url" \
+    python astromap2.py \
         --mode footprints \
         --background sky.jpg \
-        --output sky_footprints.png
+        --output astromap_footprints.png
 """
 
 from __future__ import annotations
@@ -45,11 +43,10 @@ from PIL import Image
 
 from astropy.io import fits
 from astropy.wcs import WCS
-from astropy.coordinates import SkyCoord
-import astropy.units as u
 from reproject import reproject_interp
 from reproject.mosaicking import reproject_and_coadd
 
+DEBUG = False
 
 # --------------------------------------------------------------------------
 # 1. Query the REST API for the list of files
@@ -57,13 +54,7 @@ from reproject.mosaicking import reproject_and_coadd
 
 def fetch_file_list(query_url: str, fits_path: str, jpg_path: str | None,
                     headers: dict | None) -> list[dict]:
-    """GET the API and extract (fits_url, jpg_url) pairs.
-
-    `fits_path` / `jpg_path` are dotted paths into each JSON item, e.g.
-    "files.fits" navigates item["files"]["fits"]. Set jpg_path to None if the
-    API returns FITS URLs only. If the API returns a bare list of strings,
-    they are treated as FITS URLs.
-    """
+    """GET the API and extract (fits_url, jpg_url) pairs."""
     r = requests.get(query_url, headers=headers, timeout=60)
     r.raise_for_status()
     data = r.json()
@@ -71,9 +62,13 @@ def fetch_file_list(query_url: str, fits_path: str, jpg_path: str | None,
     out = []
     for item in data['results']:
         record = {}
-        record['fits'] = item['derived_fits']
-        record['jpg'] = item['derived_raw_image']
-        out.append(record)
+        try:
+            record['name'] = item['name']
+            record['fits'] = item['derived_fits']
+            record['jpg'] = item['derived_raw_image']
+            out.append(record)
+        except Exception:
+            pass
 
     return out
 
@@ -85,6 +80,7 @@ def download(url: str, dest: Path, headers: dict | None = None) -> Path:
     with requests.get(url, stream=True, timeout=120, headers=headers) as r:
         r.raise_for_status()
         tmp = dest.with_suffix(dest.suffix + ".part")
+        print(f'downloading {url}')
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
@@ -93,7 +89,13 @@ def download(url: str, dest: Path, headers: dict | None = None) -> Path:
 
 
 def url_to_name(url: str) -> str:
-    return os.path.basename(url.split("?")[0]) or "file"
+    try:
+        name = os.path.basename(url.split("?")[0]) or "file"
+    except Exception as error:
+        print(error)
+        return None
+
+    return name
 
 
 # --------------------------------------------------------------------------
@@ -117,16 +119,16 @@ def load_image_and_wcs(fits_url: str, jpg_url: str | None,
     comes from the FITS header, which astrometry.net solved for that JPG's
     orientation. Otherwise the FITS pixel data is used.
     """
-    fits_file = download(fits_url, workdir / (url_to_name(fits_url) + ".fits"),
-                         headers)
+    fits_file = download(fits_url, workdir / (url_to_name(fits_url)),
+                          headers)
 
     with fits.open(fits_file) as hdul:
         hdu = find_wcs_hdu(hdul)
-        wcs = WCS(hdu.header)
+        wcs = WCS(hdu.header, naxis=2)
         shape = hdu.data.shape if hdu.data is not None else (0, 0)
 
         if jpg_url:
-            jpg_file = download(jpg_url, workdir / (url_to_name(jpg_url) + ".jpg"),
+            jpg_file = download(jpg_url, workdir / (url_to_name(jpg_url)),
                                 headers)
             data = np.asarray(Image.open(jpg_file).convert("RGB"))
             rgb = True
@@ -151,16 +153,14 @@ def load_image_and_wcs(fits_url: str, jpg_url: str | None,
 def allsky_wcs(resolution: float = 0.25) -> WCS:
     """Plate-carrée world grid covering the whole sky.
 
-    Layout matches a standard equirectangular all-sky map:
-    top = +90° Dec, left edge = RA 180°, RA decreasing to the right
-    (astronomy convention, RA increasing leftwards). Use --bg-flip if your
-    background image runs the other way.
+    Reference point (RA 180, Dec 0) must lie on the equator for CAR.
+    Pixel (0,0) = RA 180, Dec +90 (top-left); RA increases to the LEFT.
     """
     w = WCS(naxis=2)
     w.wcs.ctype = ["RA---CAR", "DEC--CAR"]
-    w.wcs.crpix = [1.0, 1.0]           # pixel (1,1) = top-left in FITS terms
-    w.wcs.crval = [180.0, 90.0]
-    w.wcs.cdelt = [resolution, -resolution]
+    w.wcs.crpix = [1.0, 1.0 + 90.0 / resolution]
+    w.wcs.crval = [180.0, 0.0]
+    w.wcs.cdelt = [-resolution, -resolution]
     w.wcs.cunit = ["deg", "deg"]
     w.array_shape = (int(round(180 / resolution)), int(round(360 / resolution)))
     return w
@@ -170,10 +170,19 @@ def allsky_wcs(resolution: float = 0.25) -> WCS:
 # 4. Footprints mode
 # --------------------------------------------------------------------------
 
-def footprint_vertices(wcs: WCS, shape: tuple, n_edge: int = 13) -> np.ndarray:
+def footprint_vertices(wcs: WCS, n_edge: int = 13) -> np.ndarray:
     """Sky positions along the image border (corners + edge points, for
-    fidelity on wide fields), as an (N, 2) RA/Dec array in degrees."""
-    ny, nx = shape[-2], shape[-1]
+    fidelity on wide fields), as an (N, 2) RA/Dec array in degrees.
+
+    IMPORTANT: the border is taken from the FITS pixel dimensions (the WCS
+    describes those), NOT from the JPG's shape. astrometry.net often writes
+    the solution for a frame whose size differs from the raw JPG, and using
+    the JPG shape makes footprints overshoot badly.
+    """
+    if wcs.pixel_shape:
+        nx, ny = (int(wcs.pixel_shape[0]), int(wcs.pixel_shape[1]))
+    else:
+        nx, ny = int(wcs._naxis[0]), int(wcs._naxis[1])
     t = np.linspace(0, 1, n_edge)
     border = []
     for side in range(4):
@@ -194,53 +203,71 @@ def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
                     background: str | None, bg_flip: bool,
                     output: str, resolution: float,
                     facecolor="#22d3ee", edgecolor="#67e8f9"):
-    target_wcs = allsky_wcs(resolution)
-    ny, nx = target_wcs.array_shape
+    """Footprint map on a plain (non-WCS) axes.
+
+    The CAR grid is linear in RA/Dec, so we map degrees to pixels ourselves:
+        x = (180 - RA) / resolution   (RA 180 at left, increasing leftward)
+        y = (90 + Dec) / resolution   (Dec +90 at top)
+    This avoids all WCSAxes longitude-wrap quirks (grid/ticks only being
+    drawn over part of the map when world coords run 180 -> -180).
+    """
+    ny, nx = int(round(180 / resolution)), int(round(360 / resolution))
 
     fig = plt.figure(figsize=(16, 8))
-    ax = plt.subplot(projection=target_wcs)
-    ax.set_xlim(-0.5, nx - 0.5)
-    ax.set_ylim(-0.5, ny - 0.5)
+    ax = plt.subplot()
     ax.set_facecolor("#000814")
+    ax.set_xlim(0, nx)
+    ax.set_ylim(0, ny)
 
     if background:
         bg = np.asarray(Image.open(background).convert("RGB"))
         if bg_flip:
             bg = bg[:, ::-1, :]
-        ax.imshow(bg, origin="upper", extent=(-0.5, nx - 0.5, -0.5, ny - 0.5),
+        # origin='upper': row 0 of the background (Dec +90) at the top.
+        ax.imshow(bg, extent=(0, nx, 0, ny), origin="upper",
                   aspect="auto", zorder=0, interpolation="bilinear")
 
     n_ok = 0
-    for n, item in enumerate(items):
+    for item in items:
         try:
-            data, wcs, _ = load_image_and_wcs(
-                item["fits"], item["jpg"], workdir, headers)
+            _, wcs, _ = load_image_and_wcs(item["fits"], item["jpg"], workdir, headers)
         except Exception as e:
-            print(f"  [{n}] skipped ({item['fits'][:70]}...): {e}", file=sys.stderr)
+            print(f" skipped ({item['name']}...): {e}")
             continue
-        corners = footprint_vertices(wcs, data.shape)
-        c = SkyCoord(corners[:, 0] * u.deg, corners[:, 1] * u.deg)
-        x, y = target_wcs.world2pixel(c).T
-        # Footprints that wrap around the RA=180 edge would smear across the
-        # map; skip filled polygons for those (rare for small fields).
-        if np.nanmax(x) - np.nanmin(x) > nx * 0.6:
-            continue
+
+        corners = footprint_vertices(wcs)
+        lon = corners[:, 0] % 360.0
+        lat = corners[:, 1]
+        x = ((180.0 - lon) / resolution) % nx
+        y = (90.0 + lat) / resolution
         ax.add_patch(Polygon(np.column_stack([x, y]), closed=True,
                              facecolor=facecolor, edgecolor=edgecolor,
-                             alpha=0.25, lw=0.8, zorder=2))
+                             alpha=0.5, lw=1.2, zorder=2))
+
+        # Loud debug footprint: comment out once the map looks right.
+        if DEBUG:
+            ax.add_patch(Polygon(np.column_stack([x, y]), closed=True,
+                                 facecolor="red", edgecolor="yellow",
+                                 alpha=0.8, lw=2.0, zorder=10))
+            ax.plot(x.mean(), y.mean(), "x", color="red", ms=10, zorder=11)
+
         n_ok += 1
 
-    ax.set_title(f"Footprints of {n_ok}/{len(items)} images")
+    # Manual coordinate grid: RA ticks every 30° (as hours), Dec every 30°.
+    ra_ticks = np.arange(0, 360, 30)
+    ax.set_xticks([(180.0 - r) % 360 / resolution for r in ra_ticks])
+    ax.set_xticklabels([f"{int(r / 15)}h" for r in ra_ticks], color="#94a3b8")
+    dec_ticks = np.arange(-90, 91, 30)
+    ax.set_yticks([(90.0 + d) / resolution for d in dec_ticks])
+    ax.set_yticklabels([f"{int(d)}°" for d in dec_ticks], color="#94a3b8")
     ax.grid(color="#ffffff22", lw=0.4)
-    for name in ("ra", "dec"):
-        coord = ax.coords[name]
-        coord.set_ticks(spacing=30 * u.deg)
-        coord.ticklabels.set_color("#94a3b8")
-        coord.set_ticklabel(exclude_overlapping=True)
+    ax.set_title(f"Footprints of {n_ok}/{len(items)} images")
 
     fig.savefig(output, dpi=200, bbox_inches="tight", facecolor="black")
+
     plt.close(fig)
-    print(f"Footprint map with {n_ok} footprints written to {output}")
+    print(f"Footprint map with footprints written to {output}")
+    os.startfile(output)
 
 
 # --------------------------------------------------------------------------
@@ -308,10 +335,18 @@ def build_mosaic(items: list[dict], workdir: Path, headers: dict | None,
             mosaic[~valid] = bg[~valid]
 
     fig = plt.figure(figsize=(16, 8))
-    ax = plt.subplot(projection=target_wcs)
-    ax.set_xlim(-0.5, shape_out[1] - 0.5)
-    ax.set_ylim(-0.5, shape_out[0] - 0.5)
-    ax.imshow(mosaic, origin="upper", zorder=0)
+    ax = plt.subplot()   # plain axes: mosaic row 0 = Dec +90, shown at top
+    ax.set_xlim(0, shape_out[1])
+    ax.set_ylim(0, shape_out[0])
+    ax.imshow(mosaic, extent=(0, shape_out[1], 0, shape_out[0]),
+              origin="upper", zorder=0, aspect="auto")
+
+    ra_ticks = np.arange(0, 360, 30)
+    ax.set_xticks([(180.0 - r) % 360 / resolution for r in ra_ticks])
+    ax.set_xticklabels([f"{int(r / 15)}h" for r in ra_ticks], color="#94a3b8")
+    dec_ticks = np.arange(-90, 91, 30)
+    ax.set_yticks([(90.0 + d) / resolution for d in dec_ticks])
+    ax.set_yticklabels([f"{int(d)}°" for d in dec_ticks], color="#94a3b8")
     ax.grid(color="#ffffff33", lw=0.4)
     ax.set_title(f"Mosaic of {len(inputs)} images")
     fig.savefig(output, dpi=200, bbox_inches="tight", facecolor="black")
@@ -355,11 +390,12 @@ def main():
     print("Querying API ...")
     items = fetch_file_list(args.query, args.fits_json_path, args.jpg_json_path, headers)
 
-    items = [
-        {"fits": "https://woodland.uilennest.net/astrobase/data/240213005/9934006.fits",
-         "jpg" : "https://woodland.uilennest.net/astrobase/data/240213005/240213005_raw.jpg"
-        }
-    ]
+    if DEBUG:
+        items = [
+            {"fits": "https://woodland.uilennest.net/astrobase/data/240213005/9934006.fits",
+             "jpg" : "https://woodland.uilennest.net/astrobase/data/240213005/240213005_raw.jpg"
+            }
+        ]
 
     print(f"Got {len(items)} entries.")
     if not items:
