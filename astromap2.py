@@ -23,6 +23,11 @@ Usage:
         --mode footprints \
         --background sky.jpg \
         --output astromap_footprints.png
+
+
+background maps:
+https://svs.gsfc.nasa.gov/4851/
+
 """
 
 from __future__ import annotations
@@ -52,20 +57,44 @@ DEBUG = False
 # 1. Query the REST API for the list of files
 # --------------------------------------------------------------------------
 
-def fetch_file_list(query_url: str, fits_path: str, jpg_path: str | None,
-                    headers: dict | None) -> list[dict]:
+def do_GET_LIST_page(query, page):
+    pars = {}
+
+    if page is not None:
+        pars['page'] = page
+
+    response = requests.get(query, timeout=60, params=pars)
+    json_response = response.json()
+    results = json_response["results"]
+
+    if 'next' in json_response and json_response['next']:
+        # return the next page number, if available
+        next = json_response["next"]
+        page_number = next.split('page=')[1].split('&')[0]
+    else:
+        page_number = 0
+
+    return results, page_number
+
+
+def fetch_file_list(query_url: str, fits_json_path, jpg_json_path) -> list[dict]:
+
     """GET the API and extract (fits_url, jpg_url) pairs."""
-    r = requests.get(query_url, headers=headers, timeout=60)
-    r.raise_for_status()
-    data = r.json()
+    next_page = 1
+    data = []
+    while next_page != 0:
+        results, next_page = do_GET_LIST_page(query=query_url,page=next_page)
+        data = data + results
 
     out = []
-    for item in data['results']:
+    for item in data:
         record = {}
         try:
             record['name'] = item['name']
             record['fits'] = item['derived_fits']
             record['jpg'] = item['derived_raw_image']
+            record['quality'] = item['quality']
+            record['field_fov'] = item['field_fov']
             out.append(record)
         except Exception:
             pass
@@ -92,7 +121,6 @@ def url_to_name(url: str) -> str:
     try:
         name = os.path.basename(url.split("?")[0]) or "file"
     except Exception as error:
-        print(error)
         return None
 
     return name
@@ -119,8 +147,7 @@ def load_image_and_wcs(fits_url: str, jpg_url: str | None,
     comes from the FITS header, which astrometry.net solved for that JPG's
     orientation. Otherwise the FITS pixel data is used.
     """
-    fits_file = download(fits_url, workdir / (url_to_name(fits_url)),
-                          headers)
+    fits_file = download(fits_url, workdir / (url_to_name(fits_url)),headers)
 
     with fits.open(fits_file) as hdul:
         hdu = find_wcs_hdu(hdul)
@@ -128,8 +155,7 @@ def load_image_and_wcs(fits_url: str, jpg_url: str | None,
         shape = hdu.data.shape if hdu.data is not None else (0, 0)
 
         if jpg_url:
-            jpg_file = download(jpg_url, workdir / (url_to_name(jpg_url)),
-                                headers)
+            jpg_file = download(jpg_url, workdir / (url_to_name(jpg_url)),headers)
             data = np.asarray(Image.open(jpg_file).convert("RGB"))
             rgb = True
         else:
@@ -202,7 +228,7 @@ def footprint_vertices(wcs: WCS, n_edge: int = 13) -> np.ndarray:
 def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
                     background: str | None, bg_flip: bool,
                     output: str, resolution: float,
-                    facecolor="#22d3ee", edgecolor="#67e8f9"):
+                    default_facecolor="#22d3ee", default_edgecolor="#67e8f9"):
     """Footprint map on a plain (non-WCS) axes.
 
     The CAR grid is linear in RA/Dec, so we map degrees to pixels ourselves:
@@ -232,7 +258,7 @@ def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
         try:
             _, wcs, _ = load_image_and_wcs(item["fits"], item["jpg"], workdir, headers)
         except Exception as e:
-            print(f" skipped ({item['name']}...): {e}")
+            print(f" skipped ({item['name']}...)")
             continue
 
         corners = footprint_vertices(wcs)
@@ -240,15 +266,31 @@ def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
         lat = corners[:, 1]
         x = ((180.0 - lon) / resolution) % nx
         y = (90.0 + lat) / resolution
+
+        edgecolor = default_edgecolor
+        facecolor = default_facecolor
+        zorder=2
+
+        if item['quality'] == 'great':
+            edgecolor = "#FFFF80"
+            facecolor = "#EDEEB0"
+            zorder=4
+
+        elif item['quality'] == 'good':
+            edgecolor = "#00C000"
+            facecolor = "#C0FFC0"
+            zorder=3
+        elif item['quality'] == 'medium':
+            edgecolor = "#C0C0C0"
+            facecolor = "#E6E4E4"
+            zorder=2
+
         ax.add_patch(Polygon(np.column_stack([x, y]), closed=True,
                              facecolor=facecolor, edgecolor=edgecolor,
-                             alpha=0.5, lw=1.2, zorder=2))
+                             alpha=0.1, lw=1.2, zorder=zorder))
 
         # Loud debug footprint: comment out once the map looks right.
         if DEBUG:
-            ax.add_patch(Polygon(np.column_stack([x, y]), closed=True,
-                                 facecolor="red", edgecolor="yellow",
-                                 alpha=0.8, lw=2.0, zorder=10))
             ax.plot(x.mean(), y.mean(), "x", color="red", ms=10, zorder=11)
 
         n_ok += 1
@@ -267,7 +309,7 @@ def plot_footprints(items: list[dict], workdir: Path, headers: dict | None,
 
     plt.close(fig)
     print(f"Footprint map with footprints written to {output}")
-    os.startfile(output)
+    #os.startfile(output)
 
 
 # --------------------------------------------------------------------------
@@ -361,7 +403,7 @@ def build_mosaic(items: list[dict], workdir: Path, headers: dict | None,
 def main():
     p = argparse.ArgumentParser(description="Project FITS URLs onto an all-sky image.")
     p.add_argument("--query",
-                   default="https://uilennest.net/my_astrobase/observations2/?quality=great",
+                   default="https://uilennest.net/my_astrobase/observations2/?quality__in=great,good,medium&field_fov__lte=20",
                    help="REST API URL returning a JSON list (or wrapped list)")
     p.add_argument("--fits-json-path", default="fits",
                    help="Dotted JSON path to the FITS URL in each item "
@@ -388,7 +430,7 @@ def main():
         headers = {k.strip(): v.strip()}
 
     print("Querying API ...")
-    items = fetch_file_list(args.query, args.fits_json_path, args.jpg_json_path, headers)
+    items = fetch_file_list(args.query, args.fits_json_path, args.jpg_json_path)
 
     if DEBUG:
         items = [
